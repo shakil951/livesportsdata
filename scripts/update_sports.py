@@ -1,341 +1,486 @@
 
 import json
 import os
-import re
-import urllib.request
-from datetime import datetime, timezone
-from urllib.parse import urlparse
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from urllib.error import URLError, HTTPError
+from urllib.parse import urljoin
+from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
-API = (
+# =========================================================
+# FARABI TV - SPORTS DATA AUTO UPDATER
+# =========================================================
+
+BASE_URL = "https://tflix.uk/"
+CATALOG_URL = (
     "https://tflix.uk/multiview_catalog.php"
-    "?q=&type=all&limit=100&offset={}"
+    "?q=&type=all&limit=100&offset={offset}"
 )
 
-OUTPUT = "data/sports.json"
+OUTPUT_FILE = Path("data/sports.json")
 MAX_PAGES = 20
 TIMEOUT = 25
 
-DIRECT_URL_FIELDS = (
-    "playable_url",
-    "playback_url",
-    "stream_url",
-    "manifest_url",
-    "mpd_url",
-    "m3u8_url",
-    "url"
-)
+OWNER = "Monirul Islam"
+TELEGRAM_CHANNEL = "https://t.me/sm_iptv_bd"
 
-PLAYER_URL_FIELDS = (
-    "player_url",
-    "href",
-    "embed_url",
-    "iframe_url"
-)
+# এখানে কেবল যাচাই করা TouchCric ID এবং Channel Name বসাবে।
+# উদাহরণ:
+# TOUCHCRIC_CHANNELS = {
+#     "ID": "Verified Channel Name"
+# }
+#
+# অনুমান করে ID বা channel name যোগ করবে না।
+TOUCHCRIC_CHANNELS = {
+}
 
-DRM_FIELDS = (
-    "drm",
-    "drm_type",
-    "license_url",
-    "license_server",
-    "widevine"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
 )
 
 
-def valid_url(value):
+def now_dhaka():
+    return datetime.now(
+        ZoneInfo("Asia/Dhaka")
+    )
+
+
+def formatted_time():
+    return now_dhaka().strftime(
+        "%I:%M:%S %p %d-%m-%Y"
+    )
+
+
+def fetch_json(url):
+    request = Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json, text/plain, */*"
+        }
+    )
+
+    with urlopen(request, timeout=TIMEOUT) as response:
+        content = response.read().decode("utf-8")
+
+    return json.loads(content)
+
+
+def valid_http_url(value):
     if not isinstance(value, str):
         return False
 
-    value = value.strip()
+    value = value.strip().lower()
 
-    if not value or len(value) > 8192:
-        return False
-
-    try:
-        parsed = urlparse(value)
-        return (
-            parsed.scheme in ("http", "https")
-            and bool(parsed.netloc)
-        )
-    except Exception:
-        return False
+    return value.startswith("https://") or value.startswith("http://")
 
 
-def detect_format(url):
-    if not url:
-        return "UNKNOWN"
+def absolute_url(value):
+    if not isinstance(value, str) or not value.strip():
+        return None
 
-    path = urlparse(url).path.lower()
+    resolved = urljoin(BASE_URL, value.strip())
 
-    if path.endswith(".mpd"):
-        return "DASH"
-
-    if path.endswith(".m3u8"):
-        return "HLS"
-
-    return "UNKNOWN"
-
-
-def get_first_url(item, fields):
-    for field in fields:
-        value = item.get(field)
-
-        if valid_url(value):
-            return value.strip()
+    if valid_http_url(resolved):
+        return resolved
 
     return None
 
 
-def get_drm_info(item):
-    drm = {}
+def first_value(item, fields, default=None):
+    for field in fields:
+        value = item.get(field)
 
-    for field in DRM_FIELDS:
-        if field in item:
-            value = item[field]
+        if value is not None and value != "":
+            return value
 
-            if value is not None and value != "":
-                drm[field] = value
-
-    return drm or None
+    return default
 
 
-def classify_item(item):
-    item_type = str(
-        item.get("type", "")
-    ).strip().lower()
+def get_player_url(item):
+    return absolute_url(
+        first_value(
+            item,
+            (
+                "player_url",
+                "href",
+                "embed_url",
+                "iframe_url"
+            )
+        )
+    )
 
+
+def get_direct_stream_url(item):
+    """
+    Only uses a direct URL explicitly supplied by the source.
+    Does not extract DRM-protected media from player pages.
+    """
+
+    value = first_value(
+        item,
+        (
+            "stream_url",
+            "playable_url",
+            "media_url",
+            "manifest_url",
+            "m3u8",
+            "mpd"
+        )
+    )
+
+    if valid_http_url(value):
+        return value.strip()
+
+    return None
+
+
+def detect_stream_format(url):
+    if not url:
+        return "UNKNOWN"
+
+    lower = url.lower()
+
+    if ".m3u8" in lower:
+        return "HLS"
+
+    if ".mpd" in lower:
+        return "DASH"
+
+    return "UNKNOWN"
+
+
+def normalize_status(item):
+    value = str(
+        first_value(
+            item,
+            ("status", "match_status", "state"),
+            "UPCOMING"
+        )
+    ).upper()
+
+    if value in ("LIVE", "IN PLAY", "IN_PROGRESS", "IN-PROGRESS"):
+        return "LIVE"
+
+    if value in ("FINISHED", "COMPLETED", "ENDED"):
+        return "FINISHED"
+
+    return "UPCOMING"
+
+
+def normalize_category(item):
+    value = first_value(
+        item,
+        ("category", "Category", "sport", "sport_name"),
+        "Sports"
+    )
+
+    return str(value).strip()
+
+
+def fetch_tflix_catalog():
+    all_items = []
+    pages_fetched = 0
+
+    for page in range(MAX_PAGES):
+        offset = page * 100
+        url = CATALOG_URL.format(offset=offset)
+
+        print(f"Fetching TFLIX page {page + 1}: offset={offset}")
+
+        data = fetch_json(url)
+
+        if not isinstance(data, dict):
+            raise ValueError("Unexpected TFLIX response format")
+
+        items = data.get("items", [])
+
+        if not isinstance(items, list):
+            raise ValueError("TFLIX items field is not a list")
+
+        if not items:
+            break
+
+        all_items.extend(items)
+        pages_fetched += 1
+
+        if not data.get("has_more", False):
+            break
+
+        time.sleep(0.3)
+
+    return all_items, pages_fetched
+
+
+def normalize_channel(item):
     name = str(
-        item.get("name", "")
+        first_value(item, ("name", "channel_name"), "Unknown Channel")
     ).strip()
 
-    if not name:
-        return None
-
-    item_id = item.get("id")
-
-    if item_id is None:
-        return None
-
-    direct_url = get_first_url(
-        item,
-        DIRECT_URL_FIELDS
-    )
-
-    player_url = get_first_url(
-        item,
-        PLAYER_URL_FIELDS
-    )
-
-    # Some catalogs put a direct URL in "stream".
-    stream_value = item.get("stream")
-
-    if not direct_url and valid_url(stream_value):
-        direct_url = stream_value.strip()
-
-    # If the source explicitly identifies a direct
-    # manifest, keep its actual format.
-    stream_format = detect_format(direct_url)
-
-    if stream_format == "UNKNOWN":
-        stream_format = detect_format(player_url)
-
-    if item_type == "channel":
-        category = "channel"
-    elif item_type == "event":
-        category = "event"
-    else:
-        category = "other"
+    player_url = get_player_url(item)
+    direct_url = get_direct_stream_url(item)
 
     return {
-        "id": str(item_id),
+        "id": str(item.get("id", "")),
         "name": name,
-        "type": category,
-        "original_type": item.get("type"),
         "player_url": player_url,
-        "playable_url": direct_url,
-        "stream_format": detect_format(direct_url),
-        "drm": get_drm_info(item),
-        "stream_label": (
-            stream_value
-            if isinstance(stream_value, str)
-            and not valid_url(stream_value)
-            else None
-        ),
+        "stream_url": direct_url,
+        "stream_format": detect_stream_format(direct_url),
         "source": "tflix",
         "status": (
-            "url_available"
-            if direct_url
-            else (
-                "player_available"
-                if player_url
-                else "metadata_only"
-            )
+            "player_available"
+            if player_url
+            else "metadata_only"
         )
     }
 
 
-def fetch_page(offset):
-    request = urllib.request.Request(
-        API.format(offset),
-        headers={
-            "User-Agent": "FARABI-TV-Sports/2.0",
-            "Accept": "application/json"
-        }
-    )
+def normalize_touchcric_channels():
+    channels = []
 
-    with urllib.request.urlopen(
-        request,
-        timeout=TIMEOUT
-    ) as response:
+    for channel_id, channel_name in TOUCHCRIC_CHANNELS.items():
+        channel_id = str(channel_id).strip()
+        channel_name = str(channel_name).strip()
 
-        if response.status != 200:
-            raise RuntimeError(
-                f"Catalog HTTP error: {response.status}"
-            )
+        if not channel_id or not channel_name:
+            continue
 
-        raw = response.read().decode("utf-8")
-        data = json.loads(raw)
-
-    if not isinstance(data, dict):
-        raise ValueError("Invalid catalog response")
-
-    if not isinstance(data.get("items"), list):
-        raise ValueError("Catalog items missing")
-
-    return data
-
-
-def load_previous():
-    if not os.path.exists(OUTPUT):
-        return {}
-
-    with open(OUTPUT, "r", encoding="utf-8") as file:
-        data = json.load(file)
-
-    return data if isinstance(data, dict) else {}
-
-
-def main():
-    print("Starting FARABI TV Sports Update...")
-
-    previous = load_previous()
-
-    all_items = {}
-    offset = 0
-
-    for page_number in range(MAX_PAGES):
-        print(f"Fetching catalog page {page_number + 1}...")
-
-        data = fetch_page(offset)
-        items = data["items"]
-
-        for raw_item in items:
-            if not isinstance(raw_item, dict):
-                continue
-
-            item = classify_item(raw_item)
-
-            if item:
-                key = item["id"]
-                all_items[key] = item
-
-        if not data.get("has_more") or not items:
-            break
-
-        offset += len(items)
-
-    if not all_items:
-        raise RuntimeError(
-            "No valid catalog items found. "
-            "Previous JSON will not be overwritten."
+        player_url = (
+            "https://api.touchcric.vip/drm/player.php?id="
+            + channel_id
         )
 
-    channels = []
+        channels.append({
+            "id": channel_id,
+            "name": channel_name,
+            "player_url": player_url,
+            "stream_url": None,
+            "stream_format": "UNKNOWN",
+            "source": "touchcric",
+            "status": "player_reference"
+        })
+
+    return channels
+
+
+def normalize_event(item):
+    event_name = str(
+        first_value(
+            item,
+            ("event_name", "name", "title"),
+            "Unknown Event"
+        )
+    ).strip()
+
+    channel_name = str(
+        first_value(
+            item,
+            ("stream", "channel_name", "provider"),
+            "Unknown Channel"
+        )
+    ).strip()
+
+    player_url = get_player_url(item)
+    direct_url = get_direct_stream_url(item)
+
+    stream = {
+        "channel_name": channel_name,
+        "player_url": player_url,
+        "stream_url": direct_url,
+        "stream_format": detect_stream_format(direct_url),
+        "source": "tflix"
+    }
+
+    event_info = {
+        "teamA": first_value(item, ("teamA", "team_a")),
+        "teamB": first_value(item, ("teamB", "team_b")),
+        "teamAFlag": first_value(item, ("teamAFlag", "team_a_flag")),
+        "teamBFlag": first_value(item, ("teamBFlag", "team_b_flag")),
+        "eventName": first_value(
+            item,
+            ("eventName", "tournament", "competition")
+        ),
+        "event_logo": first_value(
+            item,
+            ("event_logo", "eventLogo", "logo")
+        ),
+        "startTime": first_value(
+            item,
+            ("startTime", "start_time", "date")
+        )
+    }
+
+    return {
+        "status": normalize_status(item),
+        "Category": normalize_category(item),
+        "event_name": event_name,
+        "eventInfo": event_info,
+        "streams": [stream]
+    }
+
+
+def merge_events(items):
+    """
+    Same event appearing under multiple providers/channels
+    will be merged into one match with multiple streams.
+    """
+
+    matches = {}
+
+    for item in items:
+        item_type = str(item.get("type", "")).lower()
+
+        if item_type != "event":
+            continue
+
+        event = normalize_event(item)
+        key = event["event_name"].strip().lower()
+
+        if key not in matches:
+            matches[key] = event
+            continue
+
+        existing = matches[key]
+
+        for stream in event["streams"]:
+            existing["streams"].append(stream)
+
+        # Prefer LIVE status if any source explicitly reports LIVE.
+        if event["status"] == "LIVE":
+            existing["status"] = "LIVE"
+
+        # Fill missing event information without overwriting known data.
+        for field, value in event["eventInfo"].items():
+            if existing["eventInfo"].get(field) in (None, "") and value:
+                existing["eventInfo"][field] = value
+
+    # Remove duplicate stream entries.
+    for match in matches.values():
+        unique_streams = []
+        seen = set()
+
+        for stream in match["streams"]:
+            identity = (
+                stream.get("channel_name"),
+                stream.get("player_url"),
+                stream.get("stream_url")
+            )
+
+            if identity not in seen:
+                seen.add(identity)
+                unique_streams.append(stream)
+
+        match["streams"] = unique_streams
+
+    return list(matches.values())
+
+
+def build_output(items, pages_fetched):
+    tflix_channels = []
     events = []
-    others = []
 
-    for item in all_items.values():
-        if item["type"] == "channel":
-            channels.append(item)
+    for item in items:
+        item_type = str(item.get("type", "")).lower()
 
-        elif item["type"] == "event":
+        if item_type == "channel":
+            tflix_channels.append(normalize_channel(item))
+
+        elif item_type == "event":
             events.append(item)
 
-        else:
-            others.append(item)
+    touchcric_channels = normalize_touchcric_channels()
 
-    # Preserve manually managed stream records.
-    manual_streams = previous.get("streams", [])
+    matches = merge_events(events)
 
-    if not isinstance(manual_streams, list):
-        manual_streams = []
+    live_matches = [
+        match for match in matches
+        if match["status"] == "LIVE"
+    ]
 
-    result = {
-        "version": 2,
+    upcoming_matches = [
+        match for match in matches
+        if match["status"] == "UPCOMING"
+    ]
 
-        "last_updated": datetime.now(
-            timezone.utc
-        ).isoformat(),
+    return {
+        "name": "Live and Upcoming Sports Data",
+        "owner": OWNER,
+        "telegram_channel": TELEGRAM_CHANNEL,
+        "last_update_time": formatted_time(),
+        "total_matches": len(matches),
+        "live_match": len(live_matches),
+
+        "matches": matches,
+
+        "channels": tflix_channels + touchcric_channels,
 
         "source_status": {
             "tflix": {
                 "status": "success",
-                "records": len(all_items)
+                "records": len(items),
+                "channels": len(tflix_channels),
+                "events": len(events),
+                "pages_fetched": pages_fetched
+            },
+            "touchcric": {
+                "status": (
+                    "configured"
+                    if TOUCHCRIC_CHANNELS
+                    else "mapping_not_configured"
+                ),
+                "mapped_channels": len(touchcric_channels)
             }
-        },
-
-        "channels": channels,
-        "live_events": events,
-        "upcoming_events": [],
-
-        "other_items": others,
-
-        "streams": manual_streams
+        }
     }
 
-    os.makedirs(
-        os.path.dirname(OUTPUT),
-        exist_ok=True
-    )
 
-    temp_file = OUTPUT + ".tmp"
+def main():
+    print("========================================")
+    print(" FARABI TV SPORTS DATA UPDATER")
+    print("========================================")
 
-    with open(
-        temp_file,
-        "w",
-        encoding="utf-8"
-    ) as file:
+    try:
+        items, pages_fetched = fetch_tflix_catalog()
 
-        json.dump(
-            result,
-            file,
-            ensure_ascii=False,
-            indent=2
+        if not items:
+            raise RuntimeError("TFLIX returned no records")
+
+        output = build_output(items, pages_fetched)
+
+        OUTPUT_FILE.parent.mkdir(
+            parents=True,
+            exist_ok=True
         )
 
-        file.write("\n")
+        temporary_file = OUTPUT_FILE.with_suffix(".tmp")
 
-    os.replace(temp_file, OUTPUT)
+        with temporary_file.open("w", encoding="utf-8") as file:
+            json.dump(
+                output,
+                file,
+                ensure_ascii=False,
+                indent=2
+            )
 
-    print("--------------------------------")
-    print("SPORTS DATA UPDATE SUCCESSFUL")
-    print("--------------------------------")
-    print("Channels:", len(channels))
-    print("Events:", len(events))
-    print("Other:", len(others))
+        temporary_file.replace(OUTPUT_FILE)
 
-    playable_count = sum(
-        1 for item in all_items.values()
-        if item["playable_url"]
-    )
+        print(f"Total source records: {len(items)}")
+        print(f"Total matches: {output['total_matches']}")
+        print(f"Live matches: {output['live_match']}")
+        print(f"Channels: {len(output['channels'])}")
+        print(f"Updated: {OUTPUT_FILE}")
 
-    player_count = sum(
-        1 for item in all_items.values()
-        if item["player_url"]
-    )
+    except (HTTPError, URLError, TimeoutError, ValueError, RuntimeError) as error:
+        print(f"UPDATE FAILED: {error}", file=sys.stderr)
+        sys.exit(1)
 
-    print("Direct playable URLs:", playable_count)
-    print("Player page URLs:", player_count)
-    print("Output:", OUTPUT)
+    except Exception as error:
+        print(f"UNEXPECTED ERROR: {error}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
