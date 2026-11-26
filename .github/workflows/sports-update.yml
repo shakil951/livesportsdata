@@ -4,8 +4,8 @@ name: FARABI TV Sports Auto Update
 on:
   workflow_dispatch:
 
-  schedule:
-    - cron: "*/1 * * * *"
+#  schedule:
+ #   - cron: "*/1 * * * *"
 
 permissions:
   contents: write
