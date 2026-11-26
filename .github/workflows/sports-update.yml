@@ -1,0 +1,52 @@
+
+name: FARABI TV Sports Auto Update
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: "*/15 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: farabi-sports-update
+  cancel-in-progress: false
+
+jobs:
+  update-sports:
+    name: Fetch and Update Sports Data
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run Sports Data Fetcher
+        run: python scripts/update_sports.py
+
+      - name: Validate JSON
+        run: python -m json.tool data/sports.json > /dev/null
+
+      - name: Commit Updated Sports Data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add data/sports.json
+
+          if git diff --cached --quiet; then
+            echo "No sports data changes."
+          else
+            git commit -m "Update FARABI TV sports data"
+            git push origin HEAD:main
+          fi
